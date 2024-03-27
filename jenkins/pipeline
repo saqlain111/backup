@@ -1,0 +1,289 @@
+pipeline {
+    agent none
+
+    parameters {
+        string(name: 'branch', defaultValue: 'master', description: 'V2 release branch')
+        string(name: 'change_log', defaultValue: 'V2 release', description: 'V2 release')
+    }
+
+    environment {
+        date = java.time.LocalDate.now()
+        dat = java.time.LocalDateTime.now()
+        BUILD_NUMBER = "${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Removing old code') {
+            parallel {
+                stage('AMD') {
+                    agent { label 'minion2' }
+                    steps {
+                        sh '''
+                            cd /usr/local/share/packages/V2/alpha/basic/projects/souldapi
+                            rm -rf firmware.properties
+                            echo "Removed old code"
+                        '''
+                    }
+                }
+                stage('ARM') {
+                    agent { label 'linaro74' }
+                    steps {
+                        sh '''
+                            cd /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects/souldapi
+                            echo "Entering to souldapi dir --> $?"
+                            rm -rf firmware.properties
+                            rm -rf soulDapi
+                            echo "Removed old code"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Git checkout') {
+            parallel {
+                stage('ARM') {
+                    agent { label 'linaro74' }
+                    steps {
+                        sh '''
+                            cd /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects/souldapi
+                            git clone -b "${branch}" http://admin1:Disk1234@ncplgogs.clouzerindia.com:2496/Hub/soulDapi.git
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Image') {
+            parallel {
+                stage('ARM') {
+                    agent { label 'linaro74' }
+                    steps {
+                        sh '''
+                            cd /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects/souldapi
+                            echo "Building Image of souldapi for ARM"
+                            sudo docker build --network host -t test.clouzer.com:5443/souldapi:arm64-alpha-dev-${date}-${BUILD_NUMBER} .
+                            sudo docker push test.clouzer.com:5443/souldapi:arm64-alpha-dev-${date}-${BUILD_NUMBER}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploying code on hub') {
+            agent { label 'linaro75' }
+            steps {
+                sh '''
+                    cd /home/linaro
+                    sudo docker rm -f souldapi
+                    sudo docker rmi souldapi
+                    sudo docker pull test.clouzer.com:5443/souldapi:arm64-alpha-dev-${date}-${BUILD_NUMBER}
+                    sudo docker tag test.clouzer.com:5443/souldapi:arm64-alpha-dev-${date}-${BUILD_NUMBER} souldapi
+                    sudo docker run -v db:/home/linaro/db -v logs:/home/linaro/logs -v node_modules:/home/linaro/node_modules -v Docker_scripts:/home/linaro/docker_scripts -u="linaro" --name souldapi --env base_ip=$(sudo ifconfig $(ip route show | awk '/default/ {print $5}') | awk '/inet / {print $2}') --env broker_port="8886" --env ApplicationEnv="Docker" --env host_ip=$(hostname -I | awk '{print $2}') --env-file /etc/environment -itd -m 128M --memory-swap 256M --cpuset-cpus="1" --cpu-shares=512 souldapi
+                    echo " deployed souldapi image with new code ----> \$?"
+                    sleep 60s
+                '''
+            }
+        }
+
+        stage('Unit testing for basehub') {
+            agent { label 'minion2' }
+            steps {
+                sh '''
+                    cd /usr/local/share/packages/V2_TEST_SCRIPTS/hubtesting_basehub
+                    export PATH=/usr/local/share/packages/node-v16.19.0-linux-x64/bin:$PATH
+                    npm install
+                    node generateConfigFile.js 10.13.10.75
+                    export NODE_ENV=hubSerial
+                    export NODE_ENV=ClouzerSoulTest-97
+                    npm run basehub
+                '''
+            }
+        }
+
+        stage('Unit testing for system') {
+            agent { label 'minion2' }
+            steps {
+                sh '''
+                    cd /usr/local/share/packages/V2_TEST_SCRIPTS/hubtesting_system
+                    export PATH=/usr/local/share/packages/node-v16.19.0-linux-x64/bin:$PATH
+                    npm install
+                    node generateConfigFile.js 10.13.10.75
+                    export NODE_ENV=hubSerial
+                    export NODE_ENV=ClouzerSoulTest-97
+                    npm run test
+                '''
+            }
+            post {
+                failure {
+                    mail to: 'avinash.gaikwad@nciportal.com,pravin.dasari@nciportal.com',
+                    subject: 'souldapi release Pipeline: Failed',
+                    body: '''
+                        Failed to get process status after code is deployed on CSD-96.
+                        Please investigate and resolve the issue.
+                    '''
+                }
+            }
+        }
+
+        stage('UpdateDockerReleaseVersion Script') {
+		            parallel{
+		                  stage('UBUNTU') {
+                                       agent { label 'minion2' }
+                                     steps {
+                                         sh '''cd /usr/local/share/packages/V2/alpha/basic/souldapi/deployment
+                                               echo "Launching pod..."
+                                               echo "----------------------------------------------------------------------------------------"
+                                               echo "----------------------------------------------------------------------------------------"
+                                               echo "Launching pod for Ubuntu OS"
+                                               kubectl create -f Ubuntu_souldapi.yml
+                                               echo " Pod created successfully ---> $?"
+                                               pod_status=`kubectl get pods|grep ubuntusouldapi|awk '{print $3}'`
+                                               echo  "souldapi pod is in Running state..."
+                                               while [ $pod_status != Completed ]
+                                               do
+                                               pod_status=`kubectl get pods|grep ubuntusouldapi|awk '{print $3}'`
+                                               done
+                                               echo "----------------------------------------------------------------------------------------"
+                                               echo "souldapi pod status is ${pod_status}"
+                                               echo "----------------------------------------------------------------------------------------"
+                                               echo "Getting logs...."
+                                               kubectl logs ubuntusouldapi
+                                               echo "----------------------------------------------------------------------------------------"
+                                               echo "*******NEW CHANGES for Ubuntu*******"
+                                               Ubuntusouldapi=`kubectl logs ubuntusouldapi|grep "^ finalVersion"|awk -F ": " '{print $2}'`
+                                               echo "Ubuntu_souldapi=$Ubuntusouldapi" >> /usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties
+                                               echo "-----------------------------------------------------------------------"
+					       echo "Delete souldapi pod"
+                                               cd /usr/local/share/packages/V2/alpha/basic/souldapi/deployment
+                                               kubectl delete -f Ubuntu_souldapi.yml
+                                               echo "Pod deleted for Ubuntu Os successfully ----->$?"
+                                               cd /usr/local/share/packages/V2/alpha/basic/projects/souldapi
+                                               echo "-------------------------------------------------------------------------"'''
+				   }
+                                }
+                                   stage('DEBIAN') {
+                                       agent { label 'minion2' }
+                                      steps {
+                                           sh '''cd /usr/local/share/packages/V2/alpha/basic/souldapi/deployment
+                                                 echo "Launching pod..."
+                                                 echo "--------------------------------------------------------------------------------------"
+                                                 echo "--------------------------------------------------------------------------------------"
+                                                 echo "Launching pod for Debian OS"
+                                                 kubectl create -f Debian_souldapi.yml
+                                                 echo " Pod created successfully ---> $?"
+                                                 pod_status=`kubectl get pods|grep debiansouldapi|awk '{print $3}'`
+                                                 echo  "souldapi pod is in Running state..."
+                                                 while [ $pod_status != Completed ]
+                                                 do
+                                                 pod_status=`kubectl get pods|grep debiansouldapi|awk '{print $3}'`
+                                                 done
+                                                 echo "--------------------------------------------------------------------------------------"
+                                                 echo "souldapi pod status is ${pod_status}"
+                                                 echo "--------------------------------------------------------------------------------------"
+                                                 echo "Getting logs...."
+                                                 kubectl logs debiansouldapi
+                                                 echo "--------------------------------------------------------------------------------------"
+                                                 echo "*******NEW CHANGES for Ubuntu*******"
+                                                 Debiansouldapi=`kubectl logs debiansouldapi|grep "^ finalVersion"|awk -F ": " '{print $2}'`
+                                                 echo "Debian_souldapi=$Debiansouldapi" >> /usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties
+                                                 echo "-----------------------------------------------------------------------"
+						 echo "Delete souldapi pod"
+                                                 cd /usr/local/share/packages/V2/alpha/basic/souldapi/deployment
+                                                 kubectl delete -f Debian_souldapi.yml
+                                                 echo "Pod deleted for Debian Os successfully ----->$?"
+                                                 cd /usr/local/share/packages/V2/alpha/basic/projects/souldapi
+                                                 echo "-----------------------------------------------------------------------"
+                                                 '''
+                                   }
+                                }
+
+		        }
+	        }
+
+        stage('Updating Firmware on hub') {
+            agent { label 'linaro74' }
+            steps {
+                sh '''
+                    cd /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects_test/souldapi
+                    scp -r root@10.13.10.32:/usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties .
+                '''
+            }
+        }
+
+        stage('Image tag and push') {
+            parallel {
+                stage('ARM_UBUNTU') {
+                    agent { label 'linaro74' }
+                    steps {
+                        sh '''
+                            # Steps for ARM_UBUNTU stage
+                        '''
+                    }
+                }
+                          stage('ARM_DEBIAN') {
+                                agent { label 'linaro74' }
+                              steps {
+                                  sh '''echo "-----------------------------------------------------------------------"
+                                        debiansouldapi=`cat /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects/souldapi/firmware.properties |grep Debian|cut -d "=" -f2`
+                                        echo $debiansouldapi
+                                        cd /usr/local/share/packages/V2_HUB_IMAGES/alpha/basic/projects/souldapi
+                                        echo "-------------------------------------------------------------------------"
+                                        echo "Building Image of souldapi for Debian"
+                                        sudo docker tag test.clouzer.com:5443/souldapi:arm64-alpha-dev-${date}-${BUILD_NUMBER} test.clouzer.com:5443/souldapi:$debiansouldapi-arm64-alpha-Debian-dev
+                                        sudo docker push test.clouzer.com:5443/souldapi:$debiansouldapi-arm64-alpha-Debian-dev
+                                        sudo docker rmi test.clouzer.com:5443/souldapi:$debiansouldapi-arm64-alpha-Debian-dev
+                                        echo "-----------------------------------------------------------------------"'''
+                                }
+                        }
+                  }
+        }
+
+        stage('Version Sync with AWS') {
+            parallel {
+                stage('ubuntu') {
+                    agent { label 'minion2' }
+                    steps {
+                        script {
+                            UBUNTU_VERSION = sh(script: "cat /usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties | grep Ubuntu | cut -d \"=\" -f2", returnStdout: true).trim()
+                            echo "Ubuntu Version: ${UBUNTU_VERSION}"
+
+                            sh """
+                                # Command to sync firmware version with AWS for Ubuntu
+                            """
+                        }
+                    }
+                }
+                stage('debian') {
+                    agent { label 'minion2' }
+                    steps {
+                        script {
+                            DEBIAN_VERSION = sh(script: "cat /usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties | grep Debian | cut -d \"=\" -f2", returnStdout: true).trim()
+                            echo "Debian Version: ${DEBIAN_VERSION}"
+
+                            sh """
+                                # Command to sync firmware version with AWS for Debian
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post { 
+        success { 
+            node('minion2') {
+                script {
+                    def props = readProperties file:'/usr/local/share/packages/V2/alpha/basic/projects/souldapi/firmware.properties';
+                    env['Debian_souldapi'] = props['Debian_souldapi'];
+                    env['Ubuntu_souldapi'] = props['Ubuntu_souldapi'];
+                    echo env.Debian_souldapi
+                    echo env.Ubuntu_souldapi
+                    emailext attachLog: false, body: "Hello \nChange log: ${change_log}\nsouldapi\nTEST:UBUNTU: ${Ubuntu_souldapi}\nTEST:DEBIAN: ${Debian_souldapi}", subject: "V2 hub Test release versions for souldapi", to: "apeksha.wagh@nciportal.com,umesh.kulkarni@nciportal.com,aditya.gare@nciportal.com,android_welltek@nciportal.com,eips2node@nciportal.com,ios_welltek@nciportal.com,systemadmin@nciportal.com,hub_ce@nciportal.com"
+                }
+            }
+        }
+    }
+}
+
